@@ -54,13 +54,13 @@ app.layout = html.Div(
             style={'display': 'none'} # Hide dropdown
         ),
         dcc.Dropdown(
-        id='user-selection-dropdown',
-        options=[{'label': user_id, 'value': user_id} for user_id in df['userId'].unique() if len(df[df['userId']==user_id])>1],
-        multi=False,
-        placeholder='Select a user'
+            id='user-selection-dropdown',
+            options=[{'label': user_id, 'value': user_id} for user_id in df['userId'].unique() if len(df[df['userId']==user_id])>1],
+            multi=False,
+            placeholder='Select a user'
         ),
         dcc.Graph(id='displayed-plot'),    
-        ]
+    ]
 )
 
 
