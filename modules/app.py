@@ -12,7 +12,33 @@ import plotly.figure_factory as ff
 import plotly.express as px
 import pymongo
 import os
+from flask import Flask, request, jsonify
+from enum import Enum
+from collections import Counter, OrderedDict
+from bson import ObjectId
+import requests, json
 
+# Initialize the Dash app
+app = dash.Dash(__name__)
+
+API_BASE_URL = 'http://localhost:8080'
+
+MONGO_USER= 'MONGO_USER'
+MONGO_PASSWORD= 'MONGO_PASSWORD'
+MONGO_HOST= 'MONGO_HOST'
+MONGO_DATABASE= 'MONGO_DATABASE'
+
+class PlotType(Enum):
+    PIE = 'pie'
+    BAR = 'bar'
+    HOURLY_DIST = 'hourly_dist'
+    REACTIONS_ALONG_TIME = 'reactions_along_time'
+    TOTAL_SCORE_BOX = 'total_score_box'
+    PRESS_ACTION_CORRELATION = 'press_action_correlation'
+    USER_CHANGE = 'user_change'
+    REACTION_FREQUENCY_CHANGE = 'reaction_frequency_change'
+
+# Assuming the dataframe df is already defined
 data1 = pd.read_csv("../data/logs_05-23_19-11-48.csv")
 data2 = pd.read_csv("../data/logs_05-23_19-12-15.csv")
 data3 = pd.read_csv("../data/logs_05-23_19-12-35.csv")
@@ -20,79 +46,92 @@ data4 = pd.read_csv("../data/logs_05-23_19-13-23.csv")
 df = data2
 
 
-# Initialize the Dash app
-app = dash.Dash(__name__)
-
-env_vars = ['MONGO_USER', 'MONGO_PASSWORD', 'MONGO_HOST', 'MONGO_DATABASE']
-missing = set(env_vars) - set(os.environ)
-if missing:
-    raise Exception("Environment variables do not exist: %s" % missing)
-
-mongo_uri = "mongodb://%s:%s@%s/%s" % (os.environ['MONGO_USER'], 
-                                    os.environ['MONGO_PASSWORD'],
-                                    os.environ['MONGO_HOST'],
-                                    os.environ['MONGO_DATABASE'])
-client = pymongo.MongoClient(mongo_uri)
-db = client.get_database(os.environ['MONGO_DATABASE'])
-users_collection = db.users
-event_collection = db.events
-
-# Assuming the dataframe df is already defined
 labels = df['reaction'].unique()
 counts = df['reaction'].value_counts().values.tolist()
 df['time_label'] = pd.to_datetime(df.timestamp, unit='ms')
 df['timestamp'] = pd.to_datetime(df.timestamp, unit='ms')
 df.set_index('time_label', inplace=True)
 
+# API endpoint to retrieve plot information
+@app.server.route('/plot', methods=['GET'])
+def get_plot_data():
+    # TODO: You may add an authentication step in order to refuse to show data to unauthenticated users
+    event_id = request.args.get('event')
+    plot_type = request.args.get('type', 'pie')
+    user_id = request.args.get('user', None)
+
+    event_reactions = list(db.eventReactions.find({'eventId': event_id}))
+    if plot_type == PlotType.PIE.value:
+        reaction_counts = Counter(reaction['reaction'] for reaction in event_reactions)
+        plot_data = {
+            'labels': list(reaction_counts.keys()),
+            'values': list(reaction_counts.values()),
+        }
+
+    if plot_type == PlotType.BAR.value:
+        user_reaction_counts = Counter(reaction['userId'] for reaction in event_reactions)
+        user_reaction_counts = OrderedDict(user_reaction_counts.most_common())
+        plot_data = {
+            'labels': list(user_reaction_counts.keys()),
+            'values': list(user_reaction_counts.values()),
+        }
+
+    return jsonify(plot_data)
+
+
 # Define the app layout
-# users = list(users_collection.find({}, {'userId': 1}))
-users = list(users_collection.find({'events': {'$exists': True, '$ne': []}}, {'username': 1}))
-app.layout = html.Div(
-    children=[
-        html.H1('My Dash Application'),
-        dcc.Dropdown(
-            id='owner-selection-dropdown',
-            options=[{'label': user['username'], 'value': str(user['_id'])} for user in users],
-            multi=False,
-            placeholder='Select a user',
-            style={'display': 'block'}
-        ),
-        dcc.Dropdown(
-            id='event-selection-dropdown',
-            multi=False,
-            placeholder='Select an event',
-            style={'display': 'none'}
-        ),
-        dcc.Dropdown(
-            id='plot-type-dropdown',
-            options=[
-                {'label': 'Pie Chart', 'value': 'pie'},
-                {'label': 'Bar Plot', 'value': 'bar'},
-                {'label': 'Hourly Distribution of Interaction', 'value': 'hourly_dist'},
-                {'label': 'Change of Number of Reactions', 'value': 'reactions_along_time'},
-                {'label': 'Score Box Plot', 'value': 'total_score_box'},
-                {'label': 'Correlation of Press times and Reaction', 'value': 'press_action_correlation'},
-                {'label': "User's belief Change", 'value': 'user_change'},
-                {'label': "Reaction's Frequency Change", 'value': 'reaction_frequency_change'},
-            ],
-            value='pie'
-        ),
-        dcc.Loading(id="loading-icon", children=[html.Div(id="dropdown-container")], type="circle"),
-        dcc.Dropdown(
-            id='reaction-selection-dropdown',
-            options=[{'label': reaction, 'value': reaction} for reaction in df['reaction'].unique()],
-            multi=True,
-            style={'display': 'none'} # Hide dropdown
-        ),
-        dcc.Dropdown(
-            id='user-selection-dropdown',
-            options=[{'label': user_id, 'value': user_id} for user_id in df['userId'].unique() if len(df[df['userId']==user_id])>1],
-            multi=False,
-            placeholder='Select a user'
-        ),
-        dcc.Graph(id='displayed-plot'),    
-    ]
-)
+def build_app_layout():
+    # users = list(users_collection.find({}, {'userId': 1}))
+    users = list(db.users.find({'events': {'$exists': True, '$ne': []}}, {'username': 1}))
+    app.layout = html.Div(
+        children=[
+            html.H1('My Dash Application'),
+            dcc.Dropdown(
+                id='owner-selection-dropdown',
+                options=[{'label': user['username'], 'value': str(user['_id'])} for user in users],
+                multi=False,
+                placeholder='Select a user',
+            ),
+            dcc.Dropdown(
+                id='event-selection-dropdown',
+                multi=False,
+                placeholder='Select an event',
+                style={'display': 'none'}
+            ),
+            dcc.Dropdown(
+                id='plot-type-dropdown',
+                options=[
+                    {'label': 'Pie Chart', 'value': 'pie'},
+                    {'label': 'Bar Plot', 'value': 'bar'},
+                    {'label': 'Hourly Distribution of Interaction', 'value': 'hourly_dist'},
+                    {'label': 'Change of Number of Reactions', 'value': 'reactions_along_time'},
+                    {'label': 'Score Box Plot', 'value': 'total_score_box'},
+                    {'label': 'Correlation of Press times and Reaction', 'value': 'press_action_correlation'},
+                    {'label': "User's belief Change", 'value': 'user_change'},
+                    {'label': "Reaction's Frequency Change", 'value': 'reaction_frequency_change'},
+                ],
+                value='pie',
+                style={'display': 'none'}
+            ),
+            dcc.Loading(id="loading-icon", children=[html.Div(id="dropdown-container")], type="circle"),
+            dcc.Dropdown(
+                id='reaction-selection-dropdown',
+                options=[],
+                multi=True,
+                style={'display': 'none'} # Hide dropdown
+            ),
+            dcc.Dropdown(
+                id='user-selection-dropdown',
+                options=[],
+                multi=False,
+                placeholder='Select a user'
+            ),
+            dcc.Graph(
+                id='displayed-plot',
+                # style={'display': 'none'},
+            ),    
+        ]
+    )
 
 # Callback to update the event dropdown based on the selected user
 @app.callback(
@@ -103,36 +142,54 @@ app.layout = html.Div(
 def update_event_dropdown(selected_user):
     if selected_user:
         # Fetch events for the selected user from the database
-        user_events = event_collection.find({'owner': selected_user})
+        user_events = db.events.find({'owner': selected_user})
         event_options = [{'label': event['title'], 'value': event['uuid']} for event in user_events]
         return event_options, {'display': 'block'}
     return [], {'display': 'none'}
 
 @app.callback(
+    Output('plot-type-dropdown', 'style'),
     Output('reaction-selection-dropdown', 'style'),
     Output('reaction-selection-dropdown', 'value'),
     Output('user-selection-dropdown', 'style'),
     Output('user-selection-dropdown', 'value'),
-    [Input('plot-type-dropdown', 'value')]
+    [Input('owner-selection-dropdown', 'value'), Input('plot-type-dropdown', 'value'), Input('event-selection-dropdown', 'value')]
 )
-def update_dropdown(plot_type):
+def update_plot_dropdown(owner_id, plot_type, event_id):
+    if owner_id is None:
+        return {'display': 'none'}, {'display': 'none'}, [], {'display': 'none'}, None
     if plot_type == 'hourly_dist':
         # Display reaction-selection-dropdown and deselect all options
-        return {'display': 'block'}, [], {'display': 'none'}, None
+        return {'display': 'block'}, {'display': 'block'}, [], {'display': 'none'}, None
     elif plot_type == 'user_change':
         # Display user-selection-dropdown and select the first user by default
-        return {'display': 'none'}, None, {'display': 'block'}, df['userId'].unique()[0]
+
+        # Define the event_id for which you want to find unique users
+
+        # Use MongoDB's aggregation framework to find unique users for the event
+        pipeline = [
+            {"$match": {"eventId": ObjectId(event_id)}},
+            {"$group": {"_id": "$userId"}},
+            {"$project": {"userId": "$_id", "_id": 0}}
+        ]
+        participated_users = list(db.eventReactions.aggregate(pipeline))
+        return {'display': 'block'}, {'display': 'none'}, None, {'display': 'block'}, participated_users
     else:
         # Hide both dropdowns and clear the selected values
-        return {'display': 'none'}, None, {'display': 'none'}, None
+        return {'display': 'block'}, {'display': 'none'}, None, {'display': 'none'}, None
 
 @app.callback(
+    # Output('displayed-plot', 'style'),
     Output('displayed-plot', 'figure'),
-    [Input('plot-type-dropdown', 'value'),
+    [Input('event-selection-dropdown', 'value'),
+     Input('plot-type-dropdown', 'value'),
      Input('reaction-selection-dropdown', 'value'),
      Input('user-selection-dropdown', 'value')]
 )
-def update_graph(plot_type, reaction_selection, user_selection):
+def update_graph(event_id, plot_type, reaction_selection, user_selection):
+    if event_id is None:
+        return {}
+
     emoji_mapping = {
         '🙁': 1,
         '👎': 2,
@@ -143,14 +200,23 @@ def update_graph(plot_type, reaction_selection, user_selection):
         '👏': 7,
         '😍': 8,
     }
+
+    url = (f'{API_BASE_URL}/plot')
+    params = {
+        'type': plot_type,
+        'event': event_id,
+        'user': user_selection,
+    }
+    data = json.loads(requests.get(url, params=params).text)
+
     if plot_type == 'pie':
-        fig = go.Figure(data=[go.Pie(labels=labels, values=counts)])
+        labels, values = data['labels'], data['values']
+        fig = go.Figure(data=[go.Pie(labels=labels, values=values)])
         fig.update_layout(title_text='Pie Chart of Reactions')
         return fig
     elif plot_type == 'bar':
-        user_reaction_counts = df['userId'].value_counts()
-        fig = go.Figure(data=[go.Bar(y=user_reaction_counts.values,
-                                     hovertext=user_reaction_counts.index.astype(str))])
+        labels, values = data['labels'], data['values']
+        fig = go.Figure(data=[go.Bar(y=values, hovertext=labels)])
         fig.update_layout(title_text='Bar Plot of User Reactions', yaxis_title="Reaction Counts")
         return fig
     elif plot_type=="hourly_dist":
@@ -246,12 +312,19 @@ def update_graph(plot_type, reaction_selection, user_selection):
 
         return fig
 
-    # Remaining code for other plots as before
-
 if __name__ == '__main__':
-    app.run_server(debug=True, port=8080)
-    # html_string = app.index_string
+    env_vars = [MONGO_USER, MONGO_PASSWORD, MONGO_HOST, MONGO_DATABASE]
+    missing = set(env_vars) - set(os.environ)
+    if missing:
+        raise Exception("Environment variables do not exist: %s" % missing)
 
-    # # Save the HTML string to a file
-    # with open('dashboard.html', 'w') as file:
-    #     file.write(html_string)
+    mongo_uri = "mongodb://%s:%s@%s/%s" % (os.environ[MONGO_USER], 
+                                           os.environ[MONGO_PASSWORD],
+                                           os.environ[MONGO_HOST],
+                                           os.environ[MONGO_DATABASE])
+    client = pymongo.MongoClient(mongo_uri)
+    db = client.get_database(os.environ[MONGO_DATABASE])
+
+    build_app_layout()
+
+    app.run_server(debug=True, port=8080)
