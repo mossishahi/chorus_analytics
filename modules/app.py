@@ -17,6 +17,7 @@ from enum import Enum
 from collections import Counter, OrderedDict
 from bson import ObjectId
 import requests, json
+from datetime import datetime
 
 # Initialize the Dash app
 app = dash.Dash(__name__)
@@ -59,6 +60,7 @@ def get_plot_data():
     event_id = request.args.get('event')
     plot_type = request.args.get('type', 'pie')
     user_id = request.args.get('user', None)
+    reactions = json.loads(request.args.get('reactions', None))
 
     event_reactions = list(db.eventReactions.find({'eventId': event_id}))
     if plot_type == PlotType.PIE.value:
@@ -75,6 +77,38 @@ def get_plot_data():
             'labels': list(user_reaction_counts.keys()),
             'values': list(user_reaction_counts.values()),
         }
+
+    if plot_type == PlotType.HOURLY_DIST.value:
+        query = {'eventId': event_id}
+        if reactions:
+            query['reaction'] = {'$in': reactions}
+        event_reactions = list(db.eventReactions.find(query))
+
+        hourly_dist_data = {}
+        for reaction in event_reactions:
+            timestamp = int(reaction['timestamp']) / 1000.0
+            reaction_hour = datetime.fromtimestamp(timestamp).hour
+            
+            if reaction_hour not in hourly_dist_data:
+                hourly_dist_data[reaction_hour] = []
+                
+            hourly_dist_data[reaction_hour].append(reaction['reaction'])
+
+        # Prepare data for Plotly
+        hist_dict = {}
+        for hour, reactions in hourly_dist_data.items():
+            for reaction in reactions:
+                if reaction not in hist_dict:
+                    hist_dict[reaction] = []
+                hist_dict[reaction].append(hour)
+
+
+        for reaction, hours in hist_dict.copy().items():
+            if len(hours) < 2:
+                hist_dict.pop(reaction)
+        
+        plot_data = {'labels': list(hist_dict.keys()), 
+                     'hist_data': list(hist_dict.values())}
 
     return jsonify(plot_data)
 
@@ -151,16 +185,23 @@ def update_event_dropdown(selected_user):
     Output('plot-type-dropdown', 'style'),
     Output('reaction-selection-dropdown', 'style'),
     Output('reaction-selection-dropdown', 'value'),
+    Output('reaction-selection-dropdown', 'options'),
     Output('user-selection-dropdown', 'style'),
     Output('user-selection-dropdown', 'value'),
     [Input('owner-selection-dropdown', 'value'), Input('plot-type-dropdown', 'value'), Input('event-selection-dropdown', 'value')]
 )
 def update_plot_dropdown(owner_id, plot_type, event_id):
     if owner_id is None:
-        return {'display': 'none'}, {'display': 'none'}, [], {'display': 'none'}, None
+        return {'display': 'none'}, {'display': 'none'}, [], [], {'display': 'none'}, None
     if plot_type == 'hourly_dist':
         # Display reaction-selection-dropdown and deselect all options
-        return {'display': 'block'}, {'display': 'block'}, [], {'display': 'none'}, None
+        pipeline = [
+            {"$match": {"eventId": event_id}},
+            {"$group": {"_id": "$reaction"}},
+            {"$project": {"_id": 0, "reaction": "$_id"}}
+        ]
+        reactions = list(db.eventReactions.aggregate(pipeline))
+        return {'display': 'block'}, {'display': 'block'}, [], [{'label': r['reaction'], 'value': r['reaction']} for r in reactions], {'display': 'none'}, None
     elif plot_type == 'user_change':
         # Display user-selection-dropdown and select the first user by default
 
@@ -173,10 +214,10 @@ def update_plot_dropdown(owner_id, plot_type, event_id):
             {"$project": {"userId": "$_id", "_id": 0}}
         ]
         participated_users = list(db.eventReactions.aggregate(pipeline))
-        return {'display': 'block'}, {'display': 'none'}, None, {'display': 'block'}, participated_users
+        return {'display': 'block'}, {'display': 'none'}, None, [], {'display': 'block'}, participated_users
     else:
         # Hide both dropdowns and clear the selected values
-        return {'display': 'block'}, {'display': 'none'}, None, {'display': 'none'}, None
+        return {'display': 'block'}, {'display': 'none'}, None, [], {'display': 'none'}, None
 
 @app.callback(
     # Output('displayed-plot', 'style'),
@@ -206,8 +247,11 @@ def update_graph(event_id, plot_type, reaction_selection, user_selection):
         'type': plot_type,
         'event': event_id,
         'user': user_selection,
+        'reactions': json.dumps(reaction_selection),
     }
-    data = json.loads(requests.get(url, params=params).text)
+    if plot_type in ['pie', 'bar', 'hourly_dist']:
+        # print(requests.get(url, params=params).text)
+        data = json.loads(requests.get(url, params=params).text)
 
     if plot_type == 'pie':
         labels, values = data['labels'], data['values']
@@ -220,26 +264,8 @@ def update_graph(event_id, plot_type, reaction_selection, user_selection):
         fig.update_layout(title_text='Bar Plot of User Reactions', yaxis_title="Reaction Counts")
         return fig
     elif plot_type=="hourly_dist":
-        selected_reactions = reaction_selection or df['reaction'].unique()
-        df_selected = df[df['reaction'].isin(selected_reactions)]
-        df_selected.index = pd.to_datetime(df_selected.index)
-        # Create an 'hour' column
-        df_selected['hour'] = df_selected.index.hour
-        hist_data = []
-        group_labels = []
-        # Get all unique reactions
-        unique_reactions = df_selected['reaction'].unique()
-        # Loop through all unique reactions
-        for reaction in unique_reactions:
-            # get the hours where the reaction occurred
-            reaction_hours = df_selected[df_selected['reaction'] == reaction].hour
-            # Only add to plot if there are at least two unique values
-            if len(reaction_hours.unique()) > 1:
-                hist_data.append(reaction_hours)
-                group_labels.append(reaction)
-
-        # Create distplot with curve_type set to 'normal'
-        fig = ff.create_distplot(hist_data, group_labels, bin_size=.2, curve_type='kde', show_hist=False,)
+        labels, hist_data = data['labels'], data['hist_data']
+        fig = ff.create_distplot(hist_data, labels, bin_size=.2, curve_type='kde', show_hist=False,)
         fig.update_layout(title_text='Hourly Distribution for Selected Reactions')
         return fig
     elif plot_type=="reactions_along_time":
