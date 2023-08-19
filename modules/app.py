@@ -1,7 +1,7 @@
 import pandas as pd
 import dash
-import dash_core_components as dcc
-import dash_html_components as html
+from dash import dcc
+from dash import html
 from dash.dependencies import Input, Output
 import plotly.graph_objects as go
 import plotly.figure_factory as ff
@@ -10,6 +10,8 @@ import numpy
 import pandas as pd
 import plotly.figure_factory as ff
 import plotly.express as px
+import pymongo
+import os
 
 data1 = pd.read_csv("../data/logs_05-23_19-11-48.csv")
 data2 = pd.read_csv("../data/logs_05-23_19-12-15.csv")
@@ -17,8 +19,23 @@ data3 = pd.read_csv("../data/logs_05-23_19-12-35.csv")
 data4 = pd.read_csv("../data/logs_05-23_19-13-23.csv")
 df = data2
 
+
 # Initialize the Dash app
 app = dash.Dash(__name__)
+
+env_vars = ['MONGO_USER', 'MONGO_PASSWORD', 'MONGO_HOST', 'MONGO_DATABASE']
+missing = set(env_vars) - set(os.environ)
+if missing:
+    raise Exception("Environment variables do not exist: %s" % missing)
+
+mongo_uri = "mongodb://%s:%s@%s/%s" % (os.environ['MONGO_USER'], 
+                                    os.environ['MONGO_PASSWORD'],
+                                    os.environ['MONGO_HOST'],
+                                    os.environ['MONGO_DATABASE'])
+client = pymongo.MongoClient(mongo_uri)
+db = client.get_database(os.environ['MONGO_DATABASE'])
+users_collection = db.users
+event_collection = db.events
 
 # Assuming the dataframe df is already defined
 labels = df['reaction'].unique()
@@ -28,10 +45,24 @@ df['timestamp'] = pd.to_datetime(df.timestamp, unit='ms')
 df.set_index('time_label', inplace=True)
 
 # Define the app layout
-
+# users = list(users_collection.find({}, {'userId': 1}))
+users = list(users_collection.find({'events': {'$exists': True, '$ne': []}}, {'username': 1}))
 app.layout = html.Div(
     children=[
         html.H1('My Dash Application'),
+        dcc.Dropdown(
+            id='owner-selection-dropdown',
+            options=[{'label': user['username'], 'value': str(user['_id'])} for user in users],
+            multi=False,
+            placeholder='Select a user',
+            style={'display': 'block'}
+        ),
+        dcc.Dropdown(
+            id='event-selection-dropdown',
+            multi=False,
+            placeholder='Select an event',
+            style={'display': 'none'}
+        ),
         dcc.Dropdown(
             id='plot-type-dropdown',
             options=[
@@ -63,7 +94,19 @@ app.layout = html.Div(
     ]
 )
 
-
+# Callback to update the event dropdown based on the selected user
+@app.callback(
+    Output('event-selection-dropdown', 'options'),
+    Output('event-selection-dropdown', 'style'),
+    Input('owner-selection-dropdown', 'value')
+)
+def update_event_dropdown(selected_user):
+    if selected_user:
+        # Fetch events for the selected user from the database
+        user_events = event_collection.find({'owner': selected_user})
+        event_options = [{'label': event['title'], 'value': event['uuid']} for event in user_events]
+        return event_options, {'display': 'block'}
+    return [], {'display': 'none'}
 
 @app.callback(
     Output('reaction-selection-dropdown', 'style'),
@@ -83,14 +126,12 @@ def update_dropdown(plot_type):
         # Hide both dropdowns and clear the selected values
         return {'display': 'none'}, None, {'display': 'none'}, None
 
-
 @app.callback(
     Output('displayed-plot', 'figure'),
     [Input('plot-type-dropdown', 'value'),
      Input('reaction-selection-dropdown', 'value'),
      Input('user-selection-dropdown', 'value')]
 )
-
 def update_graph(plot_type, reaction_selection, user_selection):
     emoji_mapping = {
         '🙁': 1,
