@@ -61,6 +61,7 @@ def get_plot_data():
     plot_type = request.args.get('type', 'pie')
     user_id = request.args.get('user', None)
     reactions = json.loads(request.args.get('reactions', None))
+    emoji_mapping = json.loads(request.args.get('mapping', None))
 
     event_reactions = list(db.eventReactions.find({'eventId': event_id}))
     if plot_type == PlotType.PIE.value:
@@ -109,6 +110,117 @@ def get_plot_data():
         
         plot_data = {'labels': list(hist_dict.keys()), 
                      'hist_data': list(hist_dict.values())}
+        
+    if plot_type == PlotType.REACTIONS_ALONG_TIME.value:
+        pipeline = [
+            {"$match": {"eventId": event_id}},
+            {"$addFields": {"date": {"$toDate": {"$add": [0, "$timestamp"]}}}},
+            {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$date"}}, "count": {"$sum": 1}}},
+            {"$sort": {"_id": 1}}
+        ]
+        result = list(db.eventReactions.aggregate(pipeline))
+
+        # Prepare data for Plotly
+        plot_data = {
+            'labels': [item['_id'] for item in result],
+            'values': [item['count'] for item in result]
+        }
+
+    if plot_type == PlotType.TOTAL_SCORE_BOX.value:
+        pipeline = [
+            {"$match": {"eventId": event_id}}
+        ]
+        event_reactions = list(db.eventReactions.aggregate(pipeline))
+
+        # Prepare data for Plotly
+        for reaction in event_reactions:
+            reaction['reaction_value'] = emoji_mapping.get(reaction['reaction'], 0)
+        plot_data = {
+            'values': [r['reaction_value'] for r in event_reactions]
+        }
+
+    if plot_type == PlotType.PRESS_ACTION_CORRELATION.value:
+        # Fetch reactions associated with the event from the MongoDB collection
+        pipeline = [
+            {"$match": {"eventId": event_id}}
+        ]
+        event_reactions = list(db.eventReactions.aggregate(pipeline))
+
+        # Apply the mapping to each reaction and create a new field 'reaction_numeric'
+        for reaction in event_reactions:
+            reaction['reaction_numeric'] = emoji_mapping.get(reaction['reaction'], 0)
+
+        # Calculate the average number of presses per reaction for each user
+        pipeline = [
+            {"$match": {"eventId": event_id}},
+            {"$group": {"_id": {"userId": "$userId", "reaction_numeric": "$reaction_numeric"}, "count": {"$sum": 1}}},
+            {"$group": {"_id": "$_id.userId", "average_presses": {"$avg": "$count"}}}
+        ]
+        average_presses_result = list(db.eventReactions.aggregate(pipeline))
+
+        # Merge this information back into the event_reactions list
+        for user_data in average_presses_result:
+            user_id = user_data['_id']
+            average_presses = user_data['average_presses']
+            for reaction in event_reactions:
+                if reaction['userId'] == user_id:
+                    reaction['average_presses'] = average_presses
+
+        # Extract reaction_numeric and average_presses from event_reactions
+        reaction_numeric_values = [reaction['reaction_numeric'] for reaction in event_reactions]
+        average_presses_values = [reaction.get('average_presses', 0) for reaction in event_reactions]
+
+        plot_data = {
+            'reaction_numeric': reaction_numeric_values,
+            'average_presses': average_presses_values,
+        }
+
+    if plot_type == PlotType.USER_CHANGE.value:
+        if user_id is None: return {}
+        
+        pipeline = [
+            {"$match": {"eventId": event_id, "userId": user_id}},
+            {"$sort": {"timestamp": 1}},
+        ]
+        user_event_reactions = list(db.eventReactions.aggregate(pipeline))
+
+        # Apply the mapping to each reaction and create a new field 'reaction_value'
+        for reaction in user_event_reactions:
+            reaction['reaction_value'] = emoji_mapping.get(reaction['reaction'], 0)
+
+        # Prepare data for Plotly
+        plot_data = {
+            'timestamps': [datetime.fromtimestamp(reaction['timestamp']/1000.0) for reaction in user_event_reactions],
+            'reaction_values': [reaction['reaction_value'] for reaction in user_event_reactions],
+        }
+
+    if plot_type == PlotType.REACTION_FREQUENCY_CHANGE.value:
+        pipeline = [
+            {"$match": {"eventId": event_id}},
+            {"$addFields": {"week": {"$week": {"date": {"$toDate": "$timestamp"}}}}},
+            {"$group": {
+                "_id": {"week": "$week", "reaction": "$reaction"},
+                "count": {"$sum": 1}
+            }},
+            {"$group": {
+                "_id": "$_id.week",
+                "counts": {"$push": {"reaction": "$_id.reaction", "count": "$count"}}
+            }}
+        ]
+        result = list(db.eventReactions.aggregate(pipeline))
+
+        # Prepare data for Plotly
+        x_vals = [item['_id'] for item in result]
+        reaction_data = {reaction['reaction']: [0] * len(x_vals) for item in result for reaction in item['counts']}
+        for item in result:
+            for reaction_count in item['counts']:
+                reaction_data[reaction_count['reaction']][x_vals.index(item['_id'])] = reaction_count['count']
+
+        # Prepare data for Plotly
+        plot_data = {
+            'x_vals': x_vals,
+            'reaction_data': reaction_data,
+        }
 
     return jsonify(plot_data)
 
@@ -132,20 +244,19 @@ def build_app_layout():
                 placeholder='Select an event',
                 style={'display': 'none'}
             ),
-            dcc.Dropdown(
-                id='plot-type-dropdown',
-                options=[
-                    {'label': 'Pie Chart', 'value': 'pie'},
-                    {'label': 'Bar Plot', 'value': 'bar'},
-                    {'label': 'Hourly Distribution of Interaction', 'value': 'hourly_dist'},
-                    {'label': 'Change of Number of Reactions', 'value': 'reactions_along_time'},
-                    {'label': 'Score Box Plot', 'value': 'total_score_box'},
-                    {'label': 'Correlation of Press times and Reaction', 'value': 'press_action_correlation'},
-                    {'label': "User's belief Change", 'value': 'user_change'},
-                    {'label': "Reaction's Frequency Change", 'value': 'reaction_frequency_change'},
-                ],
-                value='pie',
-                style={'display': 'none'}
+            dcc.Tabs(
+                id='plot-type-tabs',
+                value='pie',  # Initial tab value
+                children=[
+                    dcc.Tab(label='Pie Chart', value='pie'),
+                    dcc.Tab(label='Bar Plot', value='bar'),
+                    dcc.Tab(label='Hourly Distribution', value='hourly_dist'),
+                    dcc.Tab(label='Reactions Over Time', value='reactions_along_time'),
+                    dcc.Tab(label='Score Box Plot', value='total_score_box'),
+                    dcc.Tab(label='Press-Action Correlation', value='press_action_correlation'),
+                    dcc.Tab(label="User's Belief Change", value='user_change'),
+                    dcc.Tab(label="Reaction Frequency Change", value='reaction_frequency_change'),
+                ]
             ),
             dcc.Loading(id="loading-icon", children=[html.Div(id="dropdown-container")], type="circle"),
             dcc.Dropdown(
@@ -182,17 +293,17 @@ def update_event_dropdown(selected_user):
     return [], {'display': 'none'}
 
 @app.callback(
-    Output('plot-type-dropdown', 'style'),
+    Output('plot-type-tabs', 'style'),
     Output('reaction-selection-dropdown', 'style'),
     Output('reaction-selection-dropdown', 'value'),
     Output('reaction-selection-dropdown', 'options'),
     Output('user-selection-dropdown', 'style'),
-    Output('user-selection-dropdown', 'value'),
-    [Input('owner-selection-dropdown', 'value'), Input('plot-type-dropdown', 'value'), Input('event-selection-dropdown', 'value')]
+    Output('user-selection-dropdown', 'options'),
+    [Input('owner-selection-dropdown', 'value'), Input('plot-type-tabs', 'value'), Input('event-selection-dropdown', 'value')]
 )
 def update_plot_dropdown(owner_id, plot_type, event_id):
     if owner_id is None:
-        return {'display': 'none'}, {'display': 'none'}, [], [], {'display': 'none'}, None
+        return {'display': 'none'}, {'display': 'none'}, [], [], {'display': 'none'}, []
     if plot_type == 'hourly_dist':
         # Display reaction-selection-dropdown and deselect all options
         pipeline = [
@@ -201,7 +312,7 @@ def update_plot_dropdown(owner_id, plot_type, event_id):
             {"$project": {"_id": 0, "reaction": "$_id"}}
         ]
         reactions = list(db.eventReactions.aggregate(pipeline))
-        return {'display': 'block'}, {'display': 'block'}, [], [{'label': r['reaction'], 'value': r['reaction']} for r in reactions], {'display': 'none'}, None
+        return {'display': 'block'}, {'display': 'block'}, [], [{'label': r['reaction'], 'value': r['reaction']} for r in reactions], {'display': 'none'}, []
     elif plot_type == 'user_change':
         # Display user-selection-dropdown and select the first user by default
 
@@ -209,21 +320,21 @@ def update_plot_dropdown(owner_id, plot_type, event_id):
 
         # Use MongoDB's aggregation framework to find unique users for the event
         pipeline = [
-            {"$match": {"eventId": ObjectId(event_id)}},
+            {"$match": {"eventId": event_id}},
             {"$group": {"_id": "$userId"}},
             {"$project": {"userId": "$_id", "_id": 0}}
         ]
         participated_users = list(db.eventReactions.aggregate(pipeline))
-        return {'display': 'block'}, {'display': 'none'}, None, [], {'display': 'block'}, participated_users
+        return {'display': 'block'}, {'display': 'none'}, None, [], {'display': 'block'}, [{'label': k['userId'], 'value': k['userId']} for k in participated_users]
     else:
         # Hide both dropdowns and clear the selected values
-        return {'display': 'block'}, {'display': 'none'}, None, [], {'display': 'none'}, None
+        return {'display': 'block'}, {'display': 'none'}, None, [], {'display': 'none'}, []
 
 @app.callback(
     # Output('displayed-plot', 'style'),
     Output('displayed-plot', 'figure'),
     [Input('event-selection-dropdown', 'value'),
-     Input('plot-type-dropdown', 'value'),
+     Input('plot-type-tabs', 'value'),
      Input('reaction-selection-dropdown', 'value'),
      Input('user-selection-dropdown', 'value')]
 )
@@ -231,75 +342,62 @@ def update_graph(event_id, plot_type, reaction_selection, user_selection):
     if event_id is None:
         return {}
 
-    emoji_mapping = {
-        '🙁': 1,
-        '👎': 2,
-        '🙄': 3,
-        '🙂': 4,
-        '😆': 5,
-        '👍': 6,
-        '👏': 7,
-        '😍': 8,
-    }
-
+    emoji_mapping = { '🙁': 1, '👎': 2, '🙄': 3, '🙂': 4, '😆': 5, '👍': 6, '👏': 7, '😍': 8 }
     url = (f'{API_BASE_URL}/plot')
     params = {
         'type': plot_type,
         'event': event_id,
         'user': user_selection,
         'reactions': json.dumps(reaction_selection),
+        'mapping': json.dumps(emoji_mapping),
     }
-    if plot_type in ['pie', 'bar', 'hourly_dist']:
-        # print(requests.get(url, params=params).text)
-        data = json.loads(requests.get(url, params=params).text)
+    data = json.loads(requests.get(url, params=params).text)
 
-    if plot_type == 'pie':
+    if plot_type == PlotType.PIE.value:
         labels, values = data['labels'], data['values']
         fig = go.Figure(data=[go.Pie(labels=labels, values=values)])
         fig.update_layout(title_text='Pie Chart of Reactions')
         return fig
-    elif plot_type == 'bar':
+    elif plot_type == PlotType.BAR.value:
         labels, values = data['labels'], data['values']
         fig = go.Figure(data=[go.Bar(y=values, hovertext=labels)])
         fig.update_layout(title_text='Bar Plot of User Reactions', yaxis_title="Reaction Counts")
         return fig
-    elif plot_type=="hourly_dist":
+    elif plot_type == PlotType.HOURLY_DIST.value:
         labels, hist_data = data['labels'], data['hist_data']
         fig = ff.create_distplot(hist_data, labels, bin_size=.2, curve_type='kde', show_hist=False,)
         fig.update_layout(title_text='Hourly Distribution for Selected Reactions')
         return fig
-    elif plot_type=="reactions_along_time":
-        data_count = df.groupby(df['timestamp'].dt.date).count()
+    elif plot_type == PlotType.REACTIONS_ALONG_TIME.value:
+        labels, values = data['labels'], data['values']
+        if len(labels) < 2:
+            return {}
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=data_count.index, y=data_count['reaction'], mode='lines'))
+        fig.add_trace(go.Scatter(x=labels, y=values, mode='lines'))
 
         fig.update_layout(title_text='Number of Reactions Over Time (daily)',
                         xaxis_title='Date',
                         yaxis_title='Number of Reactions')
         return fig
-    elif plot_type == "total_score_box":
-        df['reaction_value'] = df['reaction'].map(emoji_mapping).fillna(0)
+    elif plot_type == PlotType.TOTAL_SCORE_BOX.value:
+        values = data['values']
         fig = go.Figure()
-        fig.add_trace(go.Box(x=df['reaction_value'], name='Reactions', orientation='h'))
+        fig.add_trace(go.Box(x=values, name='Reactions', orientation='h'))
         fig.update_layout(
             title='Distribution of Reactions',
             xaxis=dict(title='Reaction Value')
         )
         return fig
-    elif plot_type == "press_action_correlation":
-        df['reaction_numeric'] = df['reaction'].map(emoji_mapping)
-        # Calculate the average number of presses per reaction for each user
-        average_presses = df.groupby(['userId', 'reaction_numeric']).size().groupby('userId').mean().reset_index(name='average_presses')
-        # Merge this information back into the dataframe
-        df_ = pd.merge(df, average_presses, how='left', on='userId')
+    elif plot_type == PlotType.PRESS_ACTION_CORRELATION.value:
+        reaction_numeric, average_presses = data['reaction_numeric'], data['average_presses']
         # Create hexbin plot
         fig = go.Figure(go.Histogram2d(
-            x=df_['reaction_numeric'],
-            y=df_['average_presses'],
+            x=reaction_numeric,
+            y=average_presses,
             autobinx=False,
             xbins=dict(start=0, end=8, size=1),  # Adjust size to change the resolution of the hexbins
             autobiny=False,
-            ybins=dict(start=0, end=df_['average_presses'].max(), size=df_['average_presses'].max()/20),  # Adjust size to change the resolution of the hexbins
+            ybins=dict(start=0, end=max(average_presses), size=max(average_presses)/20),  # Adjust size to change the resolution of the hexbins
             colorscale='Viridis'
         ))
         fig.update_layout(
@@ -311,29 +409,28 @@ def update_graph(event_id, plot_type, reaction_selection, user_selection):
             height=600,
         )
         return fig
-    elif plot_type=="user_change":
-        user_id = user_selection
-        user_data = df[df['userId'] == user_id]
-        # Apply the mapping function to the reaction column
-        user_data['reaction_value'] = user_data['reaction'].map(emoji_mapping).fillna(0)
+    elif plot_type == PlotType.USER_CHANGE.value:
+        if user_selection is None:
+            return {}
+        timestamps, reaction_values = data['timestamps'], data['reaction_values']
         # Plot the change in reaction over time using Plotly
-        fig = px.line(user_data, x='timestamp', y='reaction_value', title=f'Reaction Change Over Time for User ID: {user_id}')
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=timestamps, y=reaction_values, mode='lines', name='Reaction Value'))
+        # fig = px.line([timestamps, reaction_values], x='timestamp', y='reaction_value', title=f'Reaction Change Over Time for User ID: {user_selection}')
         fig.update_xaxes(title_text='Timestamp')
         fig.update_yaxes(title_text='Reaction Value')
         return fig
-    elif plot_type=="reaction_frequency_change":
-        weekly_counts = df.resample('W').reaction.value_counts()
-        # unstack the hierarchical index produced by value_counts
-        weekly_counts = weekly_counts.unstack(level=-1, fill_value=0)
+    elif plot_type == PlotType.REACTION_FREQUENCY_CHANGE.value:
+        x_vals, reaction_data = data['x_vals'], data['reaction_data']
         fig = go.Figure()
         # Loop through each unique reaction
-        for reaction in weekly_counts.columns:
-            fig.add_trace(go.Scatter(x=weekly_counts.index, 
-                                    y=weekly_counts[reaction], 
-                                    mode='lines', 
-                                    name=reaction))
+        for reaction in reaction_data:
+            fig.add_trace(go.Scatter(x=x_vals, 
+                                     y=reaction_data[reaction], 
+                                     mode='lines', 
+                                     name=reaction))
         fig.update_layout(title='Reaction frequency over time',
-                        xaxis_title='Time',
+                          xaxis_title='Time',
                         yaxis_title='Frequency')
 
         return fig
