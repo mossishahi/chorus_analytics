@@ -18,11 +18,12 @@ from collections import Counter, OrderedDict
 from bson import ObjectId
 import requests, json
 from datetime import datetime
+from flask_cors import CORS, cross_origin
 
 # Initialize the Dash app
 app = dash.Dash(__name__)
 
-API_BASE_URL = 'http://localhost:8080'
+API_BASE_URL = 'http://localhost:8088'
 
 MONGO_USER= 'MONGO_USER'
 MONGO_PASSWORD= 'MONGO_PASSWORD'
@@ -39,33 +40,20 @@ class PlotType(Enum):
     USER_CHANGE = 'user_change'
     REACTION_FREQUENCY_CHANGE = 'reaction_frequency_change'
 
-# Assuming the dataframe df is already defined
-data1 = pd.read_csv("../data/logs_05-23_19-11-48.csv")
-data2 = pd.read_csv("../data/logs_05-23_19-12-15.csv")
-data3 = pd.read_csv("../data/logs_05-23_19-12-35.csv")
-data4 = pd.read_csv("../data/logs_05-23_19-13-23.csv")
-df = data2
-
-
-labels = df['reaction'].unique()
-counts = df['reaction'].value_counts().values.tolist()
-df['time_label'] = pd.to_datetime(df.timestamp, unit='ms')
-df['timestamp'] = pd.to_datetime(df.timestamp, unit='ms')
-df.set_index('time_label', inplace=True)
-
 # API endpoint to retrieve plot information
 @app.server.route('/plot', methods=['GET'])
+@cross_origin()
 def get_plot_data():
     # TODO: You may add an authentication step in order to refuse to show data to unauthenticated users
     event_id = request.args.get('event')
     plot_type = request.args.get('type', 'pie')
     user_id = request.args.get('user', None)
-    reactions = json.loads(request.args.get('reactions', None))
-    emoji_mapping = json.loads(request.args.get('mapping', None))
+    reactions = json.loads(request.args.get('reactions', None)) if request.args.get('reactions', None) else None
+    emoji_mapping = json.loads(request.args.get('mapping', None)) if request.args.get('mapping', None) else None
 
-    event_reactions = list(db.eventReactions.find({'eventId': event_id}))
+    event_reactions = list(db.eventreactions.find({'eventId': event_id}))
     if plot_type == PlotType.PIE.value:
-        reaction_counts = Counter(reaction['reaction'] for reaction in event_reactions)
+        reaction_counts = Counter(reaction['message'] for reaction in event_reactions)
         plot_data = {
             'labels': list(reaction_counts.keys()),
             'values': list(reaction_counts.values()),
@@ -82,8 +70,8 @@ def get_plot_data():
     if plot_type == PlotType.HOURLY_DIST.value:
         query = {'eventId': event_id}
         if reactions:
-            query['reaction'] = {'$in': reactions}
-        event_reactions = list(db.eventReactions.find(query))
+            query['message'] = {'$in': reactions}
+        event_reactions = list(db.eventreactions.find(query))
 
         hourly_dist_data = {}
         for reaction in event_reactions:
@@ -93,7 +81,7 @@ def get_plot_data():
             if reaction_hour not in hourly_dist_data:
                 hourly_dist_data[reaction_hour] = []
                 
-            hourly_dist_data[reaction_hour].append(reaction['reaction'])
+            hourly_dist_data[reaction_hour].append(reaction['message'])
 
         # Prepare data for Plotly
         hist_dict = {}
@@ -118,7 +106,7 @@ def get_plot_data():
             {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$date"}}, "count": {"$sum": 1}}},
             {"$sort": {"_id": 1}}
         ]
-        result = list(db.eventReactions.aggregate(pipeline))
+        result = list(db.eventreactions.aggregate(pipeline))
 
         # Prepare data for Plotly
         plot_data = {
@@ -130,11 +118,11 @@ def get_plot_data():
         pipeline = [
             {"$match": {"eventId": event_id}}
         ]
-        event_reactions = list(db.eventReactions.aggregate(pipeline))
+        event_reactions = list(db.eventreactions.aggregate(pipeline))
 
         # Prepare data for Plotly
         for reaction in event_reactions:
-            reaction['reaction_value'] = emoji_mapping.get(reaction['reaction'], 0)
+            reaction['reaction_value'] = emoji_mapping.get(reaction['message'], 0)
         plot_data = {
             'values': [r['reaction_value'] for r in event_reactions]
         }
@@ -144,11 +132,11 @@ def get_plot_data():
         pipeline = [
             {"$match": {"eventId": event_id}}
         ]
-        event_reactions = list(db.eventReactions.aggregate(pipeline))
+        event_reactions = list(db.eventreactions.aggregate(pipeline))
 
         # Apply the mapping to each reaction and create a new field 'reaction_numeric'
         for reaction in event_reactions:
-            reaction['reaction_numeric'] = emoji_mapping.get(reaction['reaction'], 0)
+            reaction['reaction_numeric'] = emoji_mapping.get(reaction['message'], 0)
 
         # Calculate the average number of presses per reaction for each user
         pipeline = [
@@ -156,7 +144,7 @@ def get_plot_data():
             {"$group": {"_id": {"userId": "$userId", "reaction_numeric": "$reaction_numeric"}, "count": {"$sum": 1}}},
             {"$group": {"_id": "$_id.userId", "average_presses": {"$avg": "$count"}}}
         ]
-        average_presses_result = list(db.eventReactions.aggregate(pipeline))
+        average_presses_result = list(db.eventreactions.aggregate(pipeline))
 
         # Merge this information back into the event_reactions list
         for user_data in average_presses_result:
@@ -182,11 +170,11 @@ def get_plot_data():
             {"$match": {"eventId": event_id, "userId": user_id}},
             {"$sort": {"timestamp": 1}},
         ]
-        user_event_reactions = list(db.eventReactions.aggregate(pipeline))
+        user_event_reactions = list(db.eventreactions.aggregate(pipeline))
 
         # Apply the mapping to each reaction and create a new field 'reaction_value'
         for reaction in user_event_reactions:
-            reaction['reaction_value'] = emoji_mapping.get(reaction['reaction'], 0)
+            reaction['reaction_value'] = emoji_mapping.get(reaction['message'], 0)
 
         # Prepare data for Plotly
         plot_data = {
@@ -199,22 +187,22 @@ def get_plot_data():
             {"$match": {"eventId": event_id}},
             {"$addFields": {"week": {"$week": {"date": {"$toDate": "$timestamp"}}}}},
             {"$group": {
-                "_id": {"week": "$week", "reaction": "$reaction"},
+                "_id": {"week": "$week", 'message': "$message"},
                 "count": {"$sum": 1}
             }},
             {"$group": {
                 "_id": "$_id.week",
-                "counts": {"$push": {"reaction": "$_id.reaction", "count": "$count"}}
+                "counts": {"$push": {'message': "$_id.message", "count": "$count"}}
             }}
         ]
-        result = list(db.eventReactions.aggregate(pipeline))
+        result = list(db.eventreactions.aggregate(pipeline))
 
         # Prepare data for Plotly
         x_vals = [item['_id'] for item in result]
-        reaction_data = {reaction['reaction']: [0] * len(x_vals) for item in result for reaction in item['counts']}
+        reaction_data = {reaction['message']: [0] * len(x_vals) for item in result for reaction in item['counts']}
         for item in result:
             for reaction_count in item['counts']:
-                reaction_data[reaction_count['reaction']][x_vals.index(item['_id'])] = reaction_count['count']
+                reaction_data[reaction_count['message']][x_vals.index(item['_id'])] = reaction_count['count']
 
         # Prepare data for Plotly
         plot_data = {
@@ -234,7 +222,7 @@ def build_app_layout():
             html.H1('My Dash Application'),
             dcc.Dropdown(
                 id='owner-selection-dropdown',
-                options=[{'label': user['username'], 'value': str(user['_id'])} for user in users],
+                options=[{'label': user['username'], 'value': user['username']} for user in users],
                 multi=False,
                 placeholder='Select a user',
             ),
@@ -288,7 +276,7 @@ def update_event_dropdown(selected_user):
     if selected_user:
         # Fetch events for the selected user from the database
         user_events = db.events.find({'owner': selected_user})
-        event_options = [{'label': event['title'], 'value': event['uuid']} for event in user_events]
+        event_options = [{'label': event['title'], 'value': str(event['_id'])} for event in user_events]
         return event_options, {'display': 'block'}
     return [], {'display': 'none'}
 
@@ -308,11 +296,11 @@ def update_plot_dropdown(owner_id, plot_type, event_id):
         # Display reaction-selection-dropdown and deselect all options
         pipeline = [
             {"$match": {"eventId": event_id}},
-            {"$group": {"_id": "$reaction"}},
-            {"$project": {"_id": 0, "reaction": "$_id"}}
+            {"$group": {"_id": "$message"}},
+            {"$project": {"_id": 0, 'message': "$_id"}}
         ]
-        reactions = list(db.eventReactions.aggregate(pipeline))
-        return {'display': 'block'}, {'display': 'block'}, [], [{'label': r['reaction'], 'value': r['reaction']} for r in reactions], {'display': 'none'}, []
+        reactions = list(db.eventreactions.aggregate(pipeline))
+        return {'display': 'block'}, {'display': 'block'}, [], [{'label': r['message'], 'value': r['message']} for r in reactions], {'display': 'none'}, []
     elif plot_type == 'user_change':
         # Display user-selection-dropdown and select the first user by default
 
@@ -324,7 +312,7 @@ def update_plot_dropdown(owner_id, plot_type, event_id):
             {"$group": {"_id": "$userId"}},
             {"$project": {"userId": "$_id", "_id": 0}}
         ]
-        participated_users = list(db.eventReactions.aggregate(pipeline))
+        participated_users = list(db.eventreactions.aggregate(pipeline))
         return {'display': 'block'}, {'display': 'none'}, None, [], {'display': 'block'}, [{'label': k['userId'], 'value': k['userId']} for k in participated_users]
     else:
         # Hide both dropdowns and clear the selected values
@@ -450,4 +438,4 @@ if __name__ == '__main__':
 
     build_app_layout()
 
-    app.run_server(debug=True, port=8080)
+    app.run_server(debug=True, port=8088)
